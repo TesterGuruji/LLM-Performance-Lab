@@ -3,6 +3,7 @@ import requests
 import time
 
 
+
 BACKEND_URL = "http://localhost:8080"
 
 
@@ -491,7 +492,7 @@ elif operation == "Streaming Chat":
                     end_time -
                     start_time
                 )
-
+                
                 # --------------------------------------
                 # Metrics
                 # --------------------------------------

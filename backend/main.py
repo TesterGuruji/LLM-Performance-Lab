@@ -15,7 +15,7 @@ app = FastAPI(
 )
 
 OLLAMA_URL = "http://localhost:11434"
-MODEL_NAME = "llama3.1"
+MODEL_NAME = "llama3.1:8b"
 
 performance_logs = []
 # =========================================================
@@ -136,6 +136,8 @@ def chat(request: ChatRequest):
     response.raise_for_status()
 
     result = response.json()
+
+    print(result)
 
     end_time = time.perf_counter()
 
@@ -382,6 +384,7 @@ def chat_stream(request: ChatRequest):
                         "eval_count",
                         0
                     )
+                    
 
                     prompt_processing_time = (
                         data.get(
@@ -644,6 +647,7 @@ Provide a concise summary.
     response.raise_for_status()
 
     result = response.json()
+    
 
     return {
 
