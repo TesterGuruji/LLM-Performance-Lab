@@ -50,11 +50,13 @@ class PerformanceMetrics(BaseModel):
 
     ttft_sec: Optional[float]
 
+    model_load_time_sec: float
     prompt_processing_time_sec: float
     generation_time_sec: float
     total_latency_sec: float
 
     output_tokens_per_sec: float
+    tpot_ms: float
 
     status: str
 
@@ -296,6 +298,7 @@ def chat_stream(request: ChatRequest):
         input_tokens = 0
         output_tokens = 0
 
+        model_load_time = 0
         prompt_processing_time = 0
         generation_time = 0
 
@@ -384,7 +387,13 @@ def chat_stream(request: ChatRequest):
                         "eval_count",
                         0
                     )
-                    
+
+                    model_load_time = (
+                        data.get(
+                            "load_duration",
+                            0
+                        ) / 1_000_000_000
+                    )
 
                     prompt_processing_time = (
                         data.get(
@@ -414,6 +423,21 @@ def chat_stream(request: ChatRequest):
                     else:
 
                         tokens_per_sec = 0
+
+                    # ---------------------------------
+                    # TPOT (time per output token)
+                    # ---------------------------------
+
+                    if output_tokens > 0:
+
+                        tpot = (
+                            generation_time /
+                            output_tokens
+                        )
+
+                    else:
+
+                        tpot = 0
 
                     # ---------------------------------
                     # TTFT
@@ -463,6 +487,12 @@ def chat_stream(request: ChatRequest):
                             if ttft is not None
                             else None,
 
+                        "model_load_time_sec":
+                            round(
+                                model_load_time,
+                                4
+                            ),
+
                         "prompt_processing_time_sec":
                             round(
                                 prompt_processing_time,
@@ -484,6 +514,12 @@ def chat_stream(request: ChatRequest):
                         "output_tokens_per_sec":
                             round(
                                 tokens_per_sec,
+                                2
+                            ),
+
+                        "tpot_ms":
+                            round(
+                                tpot * 1000,
                                 2
                             ),
 
@@ -572,6 +608,9 @@ def chat_stream(request: ChatRequest):
                 "ttft_sec":
                     None,
 
+                "model_load_time_sec":
+                    0,
+
                 "prompt_processing_time_sec":
                     0,
 
@@ -586,6 +625,9 @@ def chat_stream(request: ChatRequest):
                     ),
 
                 "output_tokens_per_sec":
+                    0,
+
+                "tpot_ms":
                     0,
 
                 "status":

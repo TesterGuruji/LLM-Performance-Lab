@@ -188,6 +188,10 @@ if operation == "Chat":
                         result.get("output_tokens_per_sec", 0)
                     )
 
+                with st.expander("API Response"):
+
+                    st.json(result)
+
             else:
 
                 st.error(
@@ -281,6 +285,10 @@ elif operation == "Summarize":
                             0
                         )
                     )
+
+                with st.expander("API Response"):
+
+                    st.json(result)
 
             else:
 
@@ -378,6 +386,10 @@ Expected TPS: 100
                     result["test_plan"]
                 )
 
+                with st.expander("API Response"):
+
+                    st.json(result)
+
             else:
 
                 st.error(
@@ -452,6 +464,10 @@ elif operation == "Streaming Chat":
 
                     response.raise_for_status()
 
+                    request_id = response.headers.get(
+                        "X-Request-ID"
+                    )
+
                     for chunk in response.iter_content(
                         chunk_size=None,
                         decode_unicode=True
@@ -516,6 +532,98 @@ elif operation == "Streaming Chat":
                         "Total Latency",
                         f"{total_latency:.3f} sec"
                     )
+
+                # --------------------------------------
+                # LLM metrics recorded by the backend
+                # --------------------------------------
+
+                metrics_response = requests.get(
+                    f"{BACKEND_URL}/api/metrics",
+                    timeout=10
+                )
+
+                metrics_response.raise_for_status()
+
+                llm_metrics = next(
+                    (
+                        m for m in
+                        metrics_response.json()["requests"]
+                        if m["request_id"] == request_id
+                    ),
+                    {}
+                )
+
+                st.subheader("LLM Performance Metrics")
+
+                col1, col2, col3, col4 = st.columns(4)
+
+                with col1:
+
+                    st.metric(
+                        "Input Tokens",
+                        llm_metrics.get("input_tokens", 0)
+                    )
+
+                with col2:
+
+                    st.metric(
+                        "Output Tokens",
+                        llm_metrics.get("output_tokens", 0)
+                    )
+
+                with col3:
+
+                    st.metric(
+                        "Total Tokens",
+                        llm_metrics.get("total_tokens", 0)
+                    )
+
+                with col4:
+
+                    st.metric(
+                        "Model Load",
+                        f'{llm_metrics.get("model_load_time_sec", 0):.2f}s'
+                    )
+
+                col1, col2, col3, col4 = st.columns(4)
+
+                with col1:
+
+                    st.metric(
+                        "Prompt Processing",
+                        f'{llm_metrics.get("prompt_processing_time_sec", 0):.2f}s'
+                    )
+
+                with col2:
+
+                    st.metric(
+                        "Generation",
+                        f'{llm_metrics.get("generation_time_sec", 0):.2f}s'
+                    )
+
+                with col3:
+
+                    st.metric(
+                        "Output Tokens/sec",
+                        llm_metrics.get("output_tokens_per_sec", 0)
+                    )
+
+                with col4:
+
+                    st.metric(
+                        "TPOT",
+                        f'{llm_metrics.get("tpot_ms", 0):.2f} ms'
+                    )
+
+                with st.expander("API Response"):
+
+                    st.caption("/api/chat-stream (raw stream)")
+
+                    st.code(full_response, language=None)
+
+                    st.caption("/api/metrics (this request)")
+
+                    st.json(llm_metrics)
 
             except Exception as e:
 
