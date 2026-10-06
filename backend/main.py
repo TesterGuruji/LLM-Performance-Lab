@@ -7,15 +7,31 @@ from fastapi.responses import StreamingResponse
 from datetime import datetime
 from uuid import uuid4
 from typing import Optional
+from pathlib import Path
+import os
+from dotenv import load_dotenv
+from google import genai
+from google.genai import types
+
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 app = FastAPI(
     title="LLM Performance Lab",
-    description="FastAPI + Ollama + Llama 3.1",
+    description="FastAPI + Ollama + Llama 3.1 / Google Gemini",
     version="1.0"
 )
 
 OLLAMA_URL = "http://localhost:11434"
 MODEL_NAME = "llama3.1:8b"
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+
+gemini_client = (
+    genai.Client(api_key=GEMINI_API_KEY)
+    if GEMINI_API_KEY
+    else None
+)
 
 performance_logs = []
 # =========================================================
@@ -50,8 +66,9 @@ class PerformanceMetrics(BaseModel):
 
     ttft_sec: Optional[float]
 
-    model_load_time_sec: float
-    prompt_processing_time_sec: float
+    # Not exposed by cloud APIs such as Gemini → None
+    model_load_time_sec: Optional[float]
+    prompt_processing_time_sec: Optional[float]
     generation_time_sec: float
     total_latency_sec: float
 
@@ -647,6 +664,215 @@ def chat_stream(request: ChatRequest):
             "X-Request-ID": request_id
         }
     )
+
+# =========================================================
+# Gemini Chat Stream
+# =========================================================
+
+@app.post("/api/gemini-chat-stream")
+def gemini_chat_stream(request: ChatRequest):
+
+    request_id = str(uuid4())
+
+    timestamp = datetime.now().isoformat()
+
+    def generate():
+
+        start_time = time.perf_counter()
+
+        first_token_time = None
+
+        usage = None
+
+        try:
+
+            if gemini_client is None:
+
+                raise RuntimeError(
+                    "GEMINI_API_KEY is not set in .env"
+                )
+
+            # Gemini counts "thinking" tokens against
+            # max_output_tokens; keep thinking minimal so the
+            # whole budget goes to the visible answer, like
+            # Llama 3.1.
+            config = types.GenerateContentConfig(
+                temperature=request.temperature,
+                max_output_tokens=request.num_predict,
+                thinking_config=types.ThinkingConfig(
+                    thinking_level="minimal"
+                ),
+                automatic_function_calling=(
+                    types.AutomaticFunctionCallingConfig(
+                        disable=True
+                    )
+                )
+            )
+
+            stream = gemini_client.models.generate_content_stream(
+                model=GEMINI_MODEL,
+                contents=request.prompt,
+                config=config
+            )
+
+            for chunk in stream:
+
+                token = chunk.text or ""
+
+                # -------------------------------------
+                # TTFT
+                # -------------------------------------
+
+                if token and first_token_time is None:
+
+                    first_token_time = (
+                        time.perf_counter()
+                    )
+
+                    print(
+                        f"[{request_id}] "
+                        f"TTFT = {first_token_time - start_time:.4f}s"
+                    )
+
+                if token:
+
+                    yield token
+
+                # Usage metadata is cumulative; the last
+                # chunk carries the final counts.
+                if chunk.usage_metadata:
+
+                    usage = chunk.usage_metadata
+
+            end_time = time.perf_counter()
+
+            total_latency = end_time - start_time
+
+            input_tokens = (
+                usage.prompt_token_count or 0
+                if usage else 0
+            )
+
+            output_tokens = (
+                usage.candidates_token_count or 0
+                if usage else 0
+            )
+
+            thinking_tokens = (
+                usage.thoughts_token_count or 0
+                if usage else 0
+            )
+
+            # ---------------------------------
+            # Gemini does not report load / prompt
+            # processing / generation durations, so
+            # generation time is measured here as the
+            # time from first token to end of stream.
+            # ---------------------------------
+
+            if first_token_time:
+
+                ttft = first_token_time - start_time
+
+                generation_time = end_time - first_token_time
+
+            else:
+
+                ttft = None
+
+                generation_time = 0
+
+            if generation_time > 0:
+
+                tokens_per_sec = (
+                    output_tokens /
+                    generation_time
+                )
+
+            else:
+
+                tokens_per_sec = 0
+
+            if output_tokens > 0:
+
+                tpot = (
+                    generation_time /
+                    output_tokens
+                )
+
+            else:
+
+                tpot = 0
+
+            metrics = {
+                "request_id": request_id,
+                "timestamp": timestamp,
+                "endpoint": "/api/gemini-chat-stream",
+                "model": GEMINI_MODEL,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "thinking_tokens": thinking_tokens,
+                "total_tokens":
+                    input_tokens +
+                    output_tokens +
+                    thinking_tokens,
+                "ttft_sec":
+                    round(ttft, 4)
+                    if ttft is not None
+                    else None,
+                "model_load_time_sec": None,
+                "prompt_processing_time_sec": None,
+                "generation_time_sec":
+                    round(generation_time, 4),
+                "total_latency_sec":
+                    round(total_latency, 4),
+                "output_tokens_per_sec":
+                    round(tokens_per_sec, 2),
+                "tpot_ms":
+                    round(tpot * 1000, 2),
+                "status": "success"
+            }
+
+            performance_logs.append(metrics)
+
+            print(f"[{request_id}] Gemini metrics: {metrics}")
+
+        except Exception as e:
+
+            performance_logs.append({
+                "request_id": request_id,
+                "timestamp": timestamp,
+                "endpoint": "/api/gemini-chat-stream",
+                "model": GEMINI_MODEL,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "thinking_tokens": 0,
+                "total_tokens": 0,
+                "ttft_sec": None,
+                "model_load_time_sec": None,
+                "prompt_processing_time_sec": None,
+                "generation_time_sec": 0,
+                "total_latency_sec":
+                    round(
+                        time.perf_counter() -
+                        start_time,
+                        4
+                    ),
+                "output_tokens_per_sec": 0,
+                "tpot_ms": 0,
+                "status": "failed"
+            })
+
+            yield f"ERROR: {str(e)}"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/plain",
+        headers={
+            "X-Request-ID": request_id
+        }
+    )
+
 # =========================================================
 # Summarization
 # =========================================================

@@ -41,6 +41,7 @@ operation = st.sidebar.selectbox(
     [
         "Chat",
         "Streaming Chat",
+        "Gemini Streaming Chat",
         "Summarize",
         "Generate Performance Test"
     ]
@@ -401,9 +402,26 @@ Expected TPS: 100
 # =========================================================
 
 
-elif operation == "Streaming Chat":
+elif operation in ("Streaming Chat", "Gemini Streaming Chat"):
 
-    st.header("⚡ Streaming Chat")
+    is_gemini = operation == "Gemini Streaming Chat"
+
+    stream_endpoint = (
+        "/api/gemini-chat-stream"
+        if is_gemini
+        else "/api/chat-stream"
+    )
+
+    # Gemini does not report some timings → show N/A
+    def format_seconds(value):
+
+        return "N/A" if value is None else f"{value:.2f}s"
+
+    st.header(
+        "✨ Gemini Streaming Chat"
+        if is_gemini
+        else "⚡ Streaming Chat"
+    )
 
     prompt = st.text_area(
         "Enter your question",
@@ -456,7 +474,7 @@ elif operation == "Streaming Chat":
             try:
 
                 with requests.post(
-                    f"{BACKEND_URL}/api/chat-stream",
+                    f"{BACKEND_URL}{stream_endpoint}",
                     json=payload,
                     stream=True,
                     timeout=300
@@ -582,7 +600,7 @@ elif operation == "Streaming Chat":
 
                     st.metric(
                         "Model Load",
-                        f'{llm_metrics.get("model_load_time_sec", 0):.2f}s'
+                        format_seconds(llm_metrics.get("model_load_time_sec", 0))
                     )
 
                 col1, col2, col3, col4 = st.columns(4)
@@ -591,14 +609,14 @@ elif operation == "Streaming Chat":
 
                     st.metric(
                         "Prompt Processing",
-                        f'{llm_metrics.get("prompt_processing_time_sec", 0):.2f}s'
+                        format_seconds(llm_metrics.get("prompt_processing_time_sec", 0))
                     )
 
                 with col2:
 
                     st.metric(
                         "Generation",
-                        f'{llm_metrics.get("generation_time_sec", 0):.2f}s'
+                        format_seconds(llm_metrics.get("generation_time_sec", 0))
                     )
 
                 with col3:
@@ -617,7 +635,7 @@ elif operation == "Streaming Chat":
 
                 with st.expander("API Response"):
 
-                    st.caption("/api/chat-stream (raw stream)")
+                    st.caption(f"{stream_endpoint} (raw stream)")
 
                     st.code(full_response, language=None)
 
