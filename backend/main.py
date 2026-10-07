@@ -6,7 +6,8 @@ import json
 from fastapi.responses import StreamingResponse
 from datetime import datetime
 from uuid import uuid4
-from typing import Optional
+from typing import Optional, Literal
+from fastapi import HTTPException
 from pathlib import Path
 import os
 from dotenv import load_dotenv
@@ -27,8 +28,21 @@ MODEL_NAME = "llama3.1:8b"
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 
+# Retry transient Gemini errors (e.g. 503 "high demand") with backoff
 gemini_client = (
-    genai.Client(api_key=GEMINI_API_KEY)
+    genai.Client(
+        api_key=GEMINI_API_KEY,
+        http_options=types.HttpOptions(
+            retry_options=types.HttpRetryOptions(
+                attempts=5,
+                initial_delay=2,
+                max_delay=20,
+                # 429 is left out: the free-tier limit is per day,
+                # so retrying within seconds only adds delay.
+                http_status_codes=[500, 502, 503, 504]
+            )
+        )
+    )
     if GEMINI_API_KEY
     else None
 )
@@ -75,7 +89,77 @@ class PerformanceMetrics(BaseModel):
     output_tokens_per_sec: float
     tpot_ms: float
 
+    context_window: Optional[int]
+    context_window_usage_pct: Optional[float]
+
     status: str
+
+
+class EvaluateRequest(BaseModel):
+    request_id: str
+    prompt: str
+    response: str
+
+
+# Structured output schema for the LLM judge
+
+class ClaimCheck(BaseModel):
+    claim: str
+    verdict: Literal["supported", "unsupported"]
+    reason: str
+
+
+class JudgeResult(BaseModel):
+    relevance: int
+    accuracy: int
+    completeness: int
+    clarity: int
+    claims: list[ClaimCheck]
+    summary: str
+
+
+# A response "passes" quality if its average score AND its accuracy
+# score are at least this (1-10); accuracy is checked separately so a
+# fluent but wrong answer cannot pass on relevance/clarity alone.
+QUALITY_PASS_THRESHOLD = 7
+
+JUDGE_THINKING_LEVEL = os.getenv("JUDGE_THINKING_LEVEL", "minimal")
+
+# =========================================================
+# Context window helpers
+# =========================================================
+
+def get_ollama_context_window():
+
+    # The model supports 131k tokens, but Ollama runs it with
+    # a smaller num_ctx; /api/ps reports the one actually in use.
+    try:
+
+        response = requests.get(
+            f"{OLLAMA_URL}/api/ps",
+            timeout=5
+        )
+
+        for model in response.json().get("models", []):
+
+            if model.get("name") == MODEL_NAME:
+
+                return model.get("context_length")
+
+    except Exception:
+
+        pass
+
+    return None
+
+
+def context_window_usage_pct(tokens, window):
+
+    if not window:
+
+        return None
+
+    return round(tokens / window * 100, 4)
 
 # =========================================================
 # Root
@@ -472,6 +556,14 @@ def chat_stream(request: ChatRequest):
                         ttft = None
 
                     # ---------------------------------
+                    # Context window usage
+                    # ---------------------------------
+
+                    context_window = (
+                        get_ollama_context_window()
+                    )
+
+                    # ---------------------------------
                     # Metrics object
                     # ---------------------------------
 
@@ -538,6 +630,16 @@ def chat_stream(request: ChatRequest):
                             round(
                                 tpot * 1000,
                                 2
+                            ),
+
+                        "context_window":
+                            context_window,
+
+                        "context_window_usage_pct":
+                            context_window_usage_pct(
+                                input_tokens +
+                                output_tokens,
+                                context_window
                             ),
 
                         "status":
@@ -1015,6 +1117,194 @@ Provide the result in a structured format.
 # =========================================================
 # Performance Test Generator
 # =========================================================
+
+
+# =========================================================
+# Quality Evaluation (LLM-as-judge)
+# =========================================================
+
+def judge_with_gemini(judge_prompt):
+
+    if gemini_client is None:
+
+        raise RuntimeError("GEMINI_API_KEY is not set in .env")
+
+    result = gemini_client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=judge_prompt,
+        config=types.GenerateContentConfig(
+            temperature=0,
+            response_mime_type="application/json",
+            response_schema=JudgeResult,
+            thinking_config=types.ThinkingConfig(
+                thinking_level=JUDGE_THINKING_LEVEL
+            ),
+            automatic_function_calling=(
+                types.AutomaticFunctionCallingConfig(
+                    disable=True
+                )
+            )
+        )
+    )
+
+    if result.parsed is None:
+
+        raise RuntimeError("Gemini returned an unparseable evaluation")
+
+    return result.parsed
+
+
+def judge_with_ollama(judge_prompt):
+
+    # Ollama structured output: "format" takes a JSON schema
+    response = requests.post(
+        f"{OLLAMA_URL}/api/generate",
+        json={
+            "model": MODEL_NAME,
+            "prompt": judge_prompt,
+            "stream": False,
+            "format": JudgeResult.model_json_schema(),
+            "options": {
+                "temperature": 0
+            }
+        },
+        timeout=300
+    )
+
+    response.raise_for_status()
+
+    return JudgeResult.model_validate_json(
+        response.json()["response"]
+    )
+
+
+@app.post("/api/evaluate")
+def evaluate(request: EvaluateRequest):
+
+    judge_prompt = f"""
+You are a strict evaluator of answers produced by an AI assistant.
+
+QUESTION:
+{request.prompt}
+
+ANSWER:
+{request.response}
+
+Tasks:
+
+1. Extract the factual claims made in the ANSWER (at most 15).
+   Opinions, greetings and formatting are not claims.
+   Mark each claim "supported" if it is correct and consistent
+   with the question, or "unsupported" if it is false,
+   fabricated, or cannot be verified.
+
+2. Score the ANSWER from 1 (worst) to 10 (best) on:
+   - relevance: does it address the question that was asked?
+   - accuracy: are its statements correct?
+   - completeness: does it fully answer? (cut-off answers score lower)
+   - clarity: is it clear and well organised?
+
+3. Give a one-sentence summary of your verdict.
+"""
+
+    start_time = time.perf_counter()
+
+    # Gemini is the preferred (independent, stronger) judge. If it is
+    # unavailable (no key, quota exhausted, overloaded) fall back to
+    # the local Llama model so quality metrics are still produced.
+    judge_fallback_reason = None
+
+    try:
+
+        judge = judge_with_gemini(judge_prompt)
+
+        judge_model = GEMINI_MODEL
+
+    except Exception as gemini_error:
+
+        judge_fallback_reason = str(gemini_error).split("\n")[0][:200]
+
+        print(
+            f"[{request.request_id}] Gemini judge failed, "
+            f"falling back to {MODEL_NAME}: {judge_fallback_reason}"
+        )
+
+        try:
+
+            judge = judge_with_ollama(judge_prompt)
+
+            judge_model = MODEL_NAME
+
+        except Exception as ollama_error:
+
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"Gemini judge failed ({judge_fallback_reason}); "
+                    f"Ollama judge failed ({ollama_error})"
+                )
+            )
+
+    eval_latency = time.perf_counter() - start_time
+
+    # ---------------------------------
+    # Quality metrics
+    # ---------------------------------
+
+    unsupported_claims = sum(
+        1 for c in judge.claims
+        if c.verdict == "unsupported"
+    )
+
+    if judge.claims:
+
+        hallucination_rate = (
+            unsupported_claims /
+            len(judge.claims) * 100
+        )
+
+    else:
+
+        hallucination_rate = 0
+
+    quality_score = (
+        judge.relevance +
+        judge.accuracy +
+        judge.completeness +
+        judge.clarity
+    ) / 4
+
+    evaluation = {
+        "judge_model": judge_model,
+        "judge_fallback_reason": judge_fallback_reason,
+        "hallucination_rate_pct":
+            round(hallucination_rate, 2),
+        "claims_total": len(judge.claims),
+        "claims_unsupported": unsupported_claims,
+        "quality_score": round(quality_score, 2),
+        "quality_pass":
+            quality_score >= QUALITY_PASS_THRESHOLD
+            and judge.accuracy >= QUALITY_PASS_THRESHOLD,
+        "relevance": judge.relevance,
+        "accuracy": judge.accuracy,
+        "completeness": judge.completeness,
+        "clarity": judge.clarity,
+        "judge_summary": judge.summary,
+        "claims": [c.model_dump() for c in judge.claims],
+        "eval_latency_sec": round(eval_latency, 4)
+    }
+
+    # Attach to the request's performance record so
+    # /api/metrics holds performance + quality together.
+    for record in performance_logs:
+
+        if record["request_id"] == request.request_id:
+
+            record["quality"] = evaluation
+
+            break
+
+    return evaluation
 
 
 @app.get("/api/metrics")

@@ -1,10 +1,16 @@
 import streamlit as st
 import requests
 import time
+import os
+import hmac
 
 
 
 BACKEND_URL = "http://localhost:8080"
+
+# When set, visitors must enter this password (used when the
+# app is shared publicly through a tunnel). Unset = no login.
+APP_PASSWORD = os.getenv("APP_PASSWORD")
 
 
 # =========================================================
@@ -16,6 +22,31 @@ st.set_page_config(
     page_icon="🤖",
     layout="wide"
 )
+
+
+# =========================================================
+# Password Gate
+# =========================================================
+
+if APP_PASSWORD and not st.session_state.get("authenticated"):
+
+    st.title("🔒 LLM Performance Lab")
+
+    entered = st.text_input("Password", type="password")
+
+    if st.button("Log in"):
+
+        if hmac.compare_digest(entered, APP_PASSWORD):
+
+            st.session_state["authenticated"] = True
+
+            st.rerun()
+
+        else:
+
+            st.error("Incorrect password.")
+
+    st.stop()
 
 
 # =========================================================
@@ -632,6 +663,203 @@ elif operation in ("Streaming Chat", "Gemini Streaming Chat"):
                         "TPOT",
                         f'{llm_metrics.get("tpot_ms", 0):.2f} ms'
                     )
+
+                # Quality metrics are shown for the local
+                # Llama streaming chat only
+
+                if not is_gemini:
+
+                    # --------------------------------------
+                    # Quality metrics (LLM-as-judge)
+                    # --------------------------------------
+
+                    st.subheader("Quality Metrics")
+
+                    quality = None
+
+                    if full_response and not full_response.startswith("ERROR:"):
+
+                        with st.spinner("Evaluating response quality..."):
+
+                            eval_response = requests.post(
+                                f"{BACKEND_URL}/api/evaluate",
+                                json={
+                                    "request_id": request_id,
+                                    "prompt": prompt,
+                                    "response": full_response
+                                },
+                                timeout=300
+                            )
+
+                        if eval_response.status_code == 200:
+
+                            quality = eval_response.json()
+
+                        else:
+
+                            st.warning(
+                                "Quality evaluation failed: "
+                                f"{eval_response.text}"
+                            )
+
+                    else:
+
+                        st.warning(
+                            "Skipped quality evaluation: "
+                            "the model returned an error."
+                        )
+
+                    context_window = llm_metrics.get("context_window")
+
+                    context_usage = llm_metrics.get("context_window_usage_pct")
+
+                    col1, col2, col3, col4 = st.columns(4)
+
+                    with col1:
+
+                        st.metric(
+                            "Hallucination Rate",
+                            f'{quality["hallucination_rate_pct"]:.1f}%'
+                            if quality else "N/A",
+                            help=(
+                                f'{quality["claims_unsupported"]} of '
+                                f'{quality["claims_total"]} factual claims '
+                                "judged unsupported"
+                                if quality else None
+                            )
+                        )
+
+                    with col2:
+
+                        st.metric(
+                            "Quality Score",
+                            f'{quality["quality_score"]:.1f} / 10'
+                            if quality else "N/A",
+                            help="Average of relevance, accuracy, "
+                                 "completeness and clarity"
+                        )
+
+                    with col3:
+
+                        st.metric(
+                            "Quality Check",
+                            ("✅ Pass" if quality["quality_pass"] else "❌ Fail")
+                            if quality else "N/A",
+                            help="Pass = quality score ≥ 7 and accuracy ≥ 7"
+                        )
+
+                    with col4:
+
+                        st.metric(
+                            "Context Window Usage",
+                            (
+                                f"{context_usage:.2f}%"
+                                if context_usage >= 0.01
+                                else f"{context_usage:.4f}%"
+                            )
+                            if context_usage is not None else "N/A",
+                            help=(
+                                f'{llm_metrics.get("total_tokens", 0):,} of '
+                                f"{context_window:,} tokens"
+                                if context_window else None
+                            )
+                        )
+
+                    if quality:
+
+                        col1, col2, col3, col4 = st.columns(4)
+
+                        for col, name in zip(
+                            (col1, col2, col3, col4),
+                            ("relevance", "accuracy", "completeness", "clarity")
+                        ):
+
+                            with col:
+
+                                st.metric(
+                                    name.capitalize(),
+                                    f"{quality[name]} / 10"
+                                )
+
+                        st.caption(
+                            f'Judge ({quality["judge_model"]}): '
+                            f'{quality["judge_summary"]}'
+                        )
+
+                        if quality.get("judge_fallback_reason"):
+
+                            st.caption(
+                                "⚠️ Gemini judge unavailable, so the "
+                                "answer was graded by the same local model "
+                                "that wrote it (scores may be less strict). "
+                                f'Reason: {quality["judge_fallback_reason"]}'
+                            )
+
+                        with st.expander("Claim-by-claim check"):
+
+                            st.dataframe(
+                                quality["claims"],
+                                width="stretch"
+                            )
+
+                    # --------------------------------------
+                    # Session quality (all evaluated answers
+                    # from this model)
+                    # --------------------------------------
+
+                    all_records = requests.get(
+                        f"{BACKEND_URL}/api/metrics",
+                        timeout=10
+                    ).json()["requests"]
+
+                    evaluated = [
+                        r["quality"] for r in all_records
+                        if r.get("endpoint") == stream_endpoint
+                        and r.get("quality")
+                    ]
+
+                    if evaluated:
+
+                        st.subheader("Session Quality")
+
+                        col1, col2, col3, col4 = st.columns(4)
+
+                        with col1:
+
+                            st.metric(
+                                "Evaluated Responses",
+                                len(evaluated)
+                            )
+
+                        with col2:
+
+                            st.metric(
+                                "Quality Pass Rate",
+                                f'{sum(q["quality_pass"] for q in evaluated) / len(evaluated) * 100:.0f}%'
+                            )
+
+                        with col3:
+
+                            st.metric(
+                                "Avg Quality Score",
+                                f'{sum(q["quality_score"] for q in evaluated) / len(evaluated):.1f} / 10'
+                            )
+
+                        with col4:
+
+                            total_claims = sum(q["claims_total"] for q in evaluated)
+
+                            st.metric(
+                                "Overall Hallucination Rate",
+                                f'{sum(q["claims_unsupported"] for q in evaluated) / total_claims * 100:.1f}%'
+                                if total_claims else "N/A",
+                                help="Unsupported claims ÷ all claims "
+                                     "across this session"
+                            )
+
+                    if quality:
+
+                        llm_metrics["quality"] = quality
 
                 with st.expander("API Response"):
 
